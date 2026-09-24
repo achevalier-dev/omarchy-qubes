@@ -1,0 +1,627 @@
+#!/bin/bash
+# qube — Qubes-style compartments on Omarchy, built from KVM and waypipe.
+#
+# Every qube is a QEMU/KVM guest run as a systemd user unit. Its root disk is a
+# throwaway overlay on a shared template, recreated at every start, so anything
+# a compromise writes outside /home is gone after a restart. /home lives on a
+# disk of its own that survives. A disposable has no such disk and is deleted
+# when its app exits.
+#
+# App windows reach Hyprland through waypipe over SSH on a loopback-only port,
+# with the qube's name prefixed to every title. ~/.config/hypr/qubes.lua turns
+# that prefix into a coloured border, which is the whole trust signal: a red
+# border means the window belongs to a red qube, whatever the window claims.
+
+set -uo pipefail
+
+QUBE_HOME=${QUBE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/qube}
+TEMPLATES=$QUBE_HOME/templates
+QUBES=$QUBE_HOME/qubes
+KEY=$QUBE_HOME/id_ed25519
+RULES=${QUBE_RULES:-$HOME/.config/hypr/qubes.lua}
+IMAGE_URL=${QUBE_IMAGE_URL:-https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2}
+DEFAULT_PACKAGES="waypipe foot firefox ttf-dejavu noto-fonts xdg-utils"
+GUEST_USER=user
+PORT_BASE=22200
+DISP_LABEL=red
+
+declare -A COLORS=(
+  [red]="rgb(e06c75)" [orange]="rgb(e5a050)" [yellow]="rgb(e5c07b)"
+  [green]="rgb(98c379)" [gray]="rgb(8b929e)" [blue]="rgb(61afef)"
+  [purple]="rgb(c678dd)" [black]="rgb(3b3f4a)"
+)
+
+die() { echo "qube: $*" >&2; exit 1; }
+say() { echo "qube: $*" >&2; }
+
+valid_name() { [[ $1 =~ ^[a-z][a-z0-9-]{0,30}$ ]]; }
+valid_label() { [[ -n ${COLORS[$1]:-} ]]; }
+
+need() {
+  local missing=() cmd
+  for cmd in "$@"; do command -v "$cmd" >/dev/null || missing+=("$cmd"); done
+  [[ ${#missing[@]} -eq 0 ]] && return
+  die "missing ${missing[*]} — install with: omarchy pkg add qemu-base waypipe"
+}
+
+need_kvm() {
+  [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not usable by $(id -un) — add yourself to the kvm group"
+}
+
+unit() { echo "qube-$1"; }
+running() { systemctl --user is-active --quiet "$(unit "$1")"; }
+
+# conf files are KEY=value lines, parsed rather than sourced so a hand-edited
+# file cannot run anything.
+conf_get() { # <qube> <key> [default]
+  local value
+  value=$(sed -n "s/^$2=//p" "$QUBES/$1/conf" 2>/dev/null | tail -n1)
+  echo "${value:-${3:-}}"
+}
+
+conf_set() { # <qube> <key> <value>
+  local file=$QUBES/$1/conf
+  touch "$file"
+  sed -i "/^$2=/d" "$file"
+  echo "$2=$3" >>"$file"
+}
+
+exists() { [[ -f $QUBES/$1/conf ]]; }
+require_qube() { exists "$1" || die "no qube named $1"; }
+
+free_port() {
+  local port=$PORT_BASE used
+  used=$(cat "$QUBES"/*/conf 2>/dev/null | sed -n 's/^PORT=//p')
+  while grep -qx "$port" <<<"$used" || ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; do
+    port=$((port + 1))
+  done
+  echo "$port"
+}
+
+ssh_opts() { # <port>
+  echo -i "$KEY" -p "$1" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+    -o ConnectTimeout=3
+}
+
+guest_ssh() { # <qube> <command…>
+  local name=$1; shift
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$(conf_get "$name" PORT)") "$GUEST_USER@127.0.0.1" -- "$@"
+}
+
+ensure_key() {
+  [[ -f $KEY ]] && return
+  mkdir -p "$QUBE_HOME"
+  ssh-keygen -q -t ed25519 -N "" -C "qube@$(hostname)" -f "$KEY"
+}
+
+qmp() { # <socket> <command>
+  printf '{"execute":"qmp_capabilities"}\n{"execute":"%s"}\n' "$2" |
+    socat -t2 - "UNIX-CONNECT:$1" >/dev/null 2>&1
+}
+
+template_running() { running "template-$1"; }
+
+# ── boot ──────────────────────────────────────────────────────────────────────
+
+# One QEMU command line for every kind of guest. Networking is QEMU's user-mode
+# stack: each guest sits alone behind its own NAT, so qubes cannot reach one
+# another, and the only way in is the SSH port forwarded on 127.0.0.1.
+launch() { # <unit> <dir> <mem> <cpus> <port> <net> <drive…>
+  local unit=$1 dir=$2 mem=$3 cpus=$4 port=$5 net=$6; shift 6
+  local nic="user,model=virtio-net-pci,ipv6=off,hostfwd=tcp:127.0.0.1:$port-:22"
+  [[ $net == none ]] && nic+=",restrict=on"
+  local -a drives=() extra=()
+  local drive
+  for drive in "$@"; do
+    if [[ $drive == smbios=* ]]; then
+      extra+=(-smbios "type=1,serial=${drive#smbios=}")
+    else
+      drives+=(-drive "file=$drive,if=virtio,cache=writeback,discard=unmap")
+    fi
+  done
+
+  systemctl --user reset-failed "$unit" 2>/dev/null
+  systemd-run --user --quiet --collect --unit="$unit" \
+    --property=KillSignal=SIGTERM --property=TimeoutStopSec=5 \
+    qemu-system-x86_64 -name "$unit" -machine q35,accel=kvm -cpu host \
+    -m "$mem" -smp "$cpus" -display none -vga none \
+    -nic "$nic" -device virtio-rng-pci \
+    -qmp "unix:$dir/qmp.sock,server=on,wait=off" \
+    -serial "file:$dir/serial.log" \
+    "${drives[@]}" "${extra[@]}"
+}
+
+wait_ssh() { # <qube> <seconds>
+  local name=$1 deadline=$((SECONDS + $2))
+  while ((SECONDS < deadline)); do
+    running "$name" || die "$name exited during boot — see $QUBES/$name/serial.log"
+    guest_ssh "$name" true 2>/dev/null && return 0
+    sleep 1
+  done
+  die "$name did not answer SSH within $2s"
+}
+
+# ── templates ─────────────────────────────────────────────────────────────────
+
+cloud_init() { # <dir> <packages>
+  local dir=$1 packages=$2 pkg
+  mkdir -p "$dir"
+  printf 'instance-id: qube-template-%s\nlocal-hostname: template\n' "$(date +%s)" >"$dir/meta-data"
+  : >"$dir/vendor-data"
+  {
+    cat <<EOF
+#cloud-config
+users:
+  - name: $GUEST_USER
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+ssh_pwauth: false
+disable_root: true
+package_update: true
+package_upgrade: true
+packages:
+EOF
+    for pkg in $packages; do echo "  - $pkg"; done
+    cat <<EOF
+write_files:
+  - path: /etc/ssh/authorized_keys/$GUEST_USER
+    permissions: "0644"
+    content: |
+      $(cat "$KEY.pub")
+  - path: /etc/ssh/sshd_config.d/10-qube.conf
+    content: |
+      AuthorizedKeysFile /etc/ssh/authorized_keys/%u
+      PasswordAuthentication no
+      X11Forwarding no
+  - path: /usr/local/bin/qube-home
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # The second disk, when there is one, is this qube's /home. A disposable
+      # has none and keeps the template's.
+      set -e
+      dev=/dev/vdb
+      [ -b "\$dev" ] || exit 0
+      blkid "\$dev" >/dev/null || mkfs.ext4 -q -L qubehome "\$dev"
+      mount "\$dev" /home
+      if [ ! -d /home/$GUEST_USER ]; then
+        cp -a /etc/skel /home/$GUEST_USER
+        chown -R $GUEST_USER:$GUEST_USER /home/$GUEST_USER
+      fi
+  - path: /etc/systemd/system/qube-home.service
+    content: |
+      [Unit]
+      Description=Mount this qube's private /home
+      DefaultDependencies=no
+      After=local-fs.target
+      Before=sshd.service systemd-user-sessions.service
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/qube-home
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [systemctl, enable, qube-home.service, sshd.service]
+  - [touch, /etc/cloud/cloud-init.disabled]
+power_state:
+  mode: poweroff
+  timeout: 60
+EOF
+  } >"$dir/user-data"
+}
+
+# Desktop entries the template ships, cached so the menu can offer them without
+# booting anything: "<name>\t<command>" per line.
+sync_apps() { # <template> <port>
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$2") "$GUEST_USER@127.0.0.1" -- \
+    'for f in /usr/share/applications/*.desktop; do
+       grep -q "^NoDisplay=true" "$f" && continue
+       awk -F= "/^\[/{s=(\$0==\"[Desktop Entry]\")} s&&/^Name=/&&!n{n=substr(\$0,6)} s&&/^Exec=/&&!e{e=substr(\$0,6)} END{if(n&&e)print n\"\t\"e}" "$f"
+     done' 2>/dev/null |
+    sed -E 's/ ?%[fFuUdDnNickvm]//g' | sort -u >"$TEMPLATES/$1.apps.tmp" &&
+    mv "$TEMPLATES/$1.apps.tmp" "$TEMPLATES/$1.apps"
+}
+
+template_boot() { # <template> — start the template itself, writable
+  local t=$1 dir=$TEMPLATES/$1.run port
+  port=$(free_port)
+  mkdir -p "$dir"
+  launch "$(unit "template-$t")" "$dir" 2G 2 "$port" user "$TEMPLATES/$t.qcow2"
+  echo "$port"
+}
+
+template_users() { # <template> — running qubes built on it
+  local conf name
+  for conf in "$QUBES"/*/conf; do
+    [[ -f $conf ]] || continue
+    name=$(basename "$(dirname "$conf")")
+    [[ $(conf_get "$name" TEMPLATE) == "$1" ]] && running "$name" && echo "$name"
+  done
+}
+
+cmd_template() {
+  local action=${1:-list}; shift || true
+  case $action in
+    list)
+      local f
+      for f in "$TEMPLATES"/*.qcow2; do [[ -f $f ]] && basename "$f" .qcow2; done
+      ;;
+    create) template_create "$@" ;;
+    update) template_update "$@" ;;
+    shell) template_shell "$@" ;;
+    delete) template_delete "$@" ;;
+    *) die "template list|create|update|shell|delete" ;;
+  esac
+}
+
+template_create() {
+  local t=${1:-arch} packages=$DEFAULT_PACKAGES size=20G
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --packages) packages="$DEFAULT_PACKAGES $2"; shift 2 ;;
+      --size) size=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  valid_name "$t" || die "bad template name $t"
+  need qemu-system-x86_64 qemu-img socat curl python3
+  need_kvm
+  ensure_key
+  mkdir -p "$TEMPLATES"
+  [[ -f $TEMPLATES/$t.qcow2 ]] && die "template $t exists — use: qube template update $t"
+
+  local base=$TEMPLATES/.base.qcow2
+  if [[ ! -f $base ]]; then
+    say "downloading Arch cloud image"
+    curl -fL --progress-bar -o "$base.part" "$IMAGE_URL" || die "download failed"
+    mv "$base.part" "$base"
+  fi
+  cp --reflink=auto "$base" "$TEMPLATES/$t.qcow2"
+  qemu-img resize -q "$TEMPLATES/$t.qcow2" "$size"
+
+  # cloud-init's NoCloud source fetched over HTTP from the host: QEMU's user
+  # network maps 10.0.2.2 to the host's loopback, so the server never listens
+  # beyond 127.0.0.1.
+  local seed=$TEMPLATES/$t.run/seed http_port
+  cloud_init "$seed" "$packages"
+  http_port=$(free_port)
+  python3 -m http.server --bind 127.0.0.1 --directory "$seed" "$http_port" >/dev/null 2>&1 &
+  local http_pid=$!
+  trap 'kill $http_pid 2>/dev/null' EXIT
+
+  local dir=$TEMPLATES/$t.run port
+  port=$(free_port)
+  [[ $port == "$http_port" ]] && port=$((port + 1))
+  launch "$(unit "template-$t")" "$dir" 4G 4 "$port" user \
+    "$TEMPLATES/$t.qcow2" "smbios=ds=nocloud;s=http://10.0.2.2:$http_port/"
+
+  say "installing $packages — this takes a few minutes; progress in $dir/serial.log"
+  while template_running "$t"; do sleep 3; done
+  kill "$http_pid" 2>/dev/null
+  trap - EXIT
+  grep -q "Cloud-init .* finished" "$dir/serial.log" 2>/dev/null ||
+    say "warning: no sign cloud-init finished — check $dir/serial.log"
+
+  template_update "$t"
+  say "template $t ready"
+}
+
+template_update() {
+  local t=${1:?template name}
+  [[ -f $TEMPLATES/$t.qcow2 ]] || die "no template $t"
+  need qemu-system-x86_64 socat
+  need_kvm
+  local users
+  users=$(template_users "$t")
+  [[ -z $users ]] || die "stop these first, they run on $t: $users"
+  template_running "$t" && die "template $t is already running"
+
+  local port
+  port=$(template_boot "$t")
+  local deadline=$((SECONDS + 120))
+  # shellcheck disable=SC2046
+  until ssh $(ssh_opts "$port") "$GUEST_USER@127.0.0.1" true 2>/dev/null; do
+    ((SECONDS < deadline)) || { systemctl --user stop "$(unit "template-$t")"; die "template $t did not boot"; }
+    sleep 1
+  done
+  say "updating $t"
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$port") "$GUEST_USER@127.0.0.1" -- sudo pacman -Syu --noconfirm
+  sync_apps "$t" "$port"
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$port") "$GUEST_USER@127.0.0.1" -- sudo systemctl poweroff 2>/dev/null
+  while template_running "$t"; do sleep 1; done
+}
+
+# An interactive shell in the template, for installing software every qube
+# built on it should have. Apps are re-cached on the way out.
+template_shell() {
+  local t=${1:?template name}
+  [[ -f $TEMPLATES/$t.qcow2 ]] || die "no template $t"
+  local users
+  users=$(template_users "$t")
+  [[ -z $users ]] || die "stop these first, they run on $t: $users"
+  local port deadline=$((SECONDS + 120))
+  port=$(template_boot "$t")
+  # shellcheck disable=SC2046
+  until ssh $(ssh_opts "$port") "$GUEST_USER@127.0.0.1" true 2>/dev/null; do
+    ((SECONDS < deadline)) || die "template $t did not boot"
+    sleep 1
+  done
+  say "shell in template $t — changes reach every qube on its next start"
+  # shellcheck disable=SC2046
+  ssh -t $(ssh_opts "$port") "$GUEST_USER@127.0.0.1"
+  sync_apps "$t" "$port"
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts "$port") "$GUEST_USER@127.0.0.1" -- sudo systemctl poweroff 2>/dev/null
+  while template_running "$t"; do sleep 1; done
+}
+
+template_delete() {
+  local t=${1:?template name} conf
+  for conf in "$QUBES"/*/conf; do
+    [[ -f $conf ]] && grep -qx "TEMPLATE=$t" "$conf" && die "qube $(basename "$(dirname "$conf")") uses $t"
+  done
+  rm -rf "$TEMPLATES/$t.qcow2" "$TEMPLATES/$t.apps" "$TEMPLATES/$t.run"
+}
+
+# ── qubes ─────────────────────────────────────────────────────────────────────
+
+cmd_create() {
+  local name=${1:-}; shift || true
+  valid_name "$name" || die "usage: qube create <name> [--label red] [--template arch] [--mem 2G] [--cpus 2] [--net user|none] [--home 10G]"
+  exists "$name" && die "$name already exists"
+  local label=gray template="" mem=2G cpus=2 net=user home=10G disposable=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --label) label=$2; shift 2 ;;
+      --template) template=$2; shift 2 ;;
+      --mem) mem=$2; shift 2 ;;
+      --cpus) cpus=$2; shift 2 ;;
+      --net) net=$2; shift 2 ;;
+      --home) home=$2; shift 2 ;;
+      --disposable) disposable=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  valid_label "$label" || die "label must be one of: ${!COLORS[*]}"
+  [[ $net == user || $net == none ]] || die "--net is user or none"
+  template=${template:-$(cmd_template list | head -n1)}
+  [[ -n $template && -f $TEMPLATES/$template.qcow2 ]] || die "no template — run: qube template create"
+  need qemu-img
+
+  mkdir -p "$QUBES/$name"
+  conf_set "$name" LABEL "$label"
+  conf_set "$name" TEMPLATE "$template"
+  conf_set "$name" MEM "$mem"
+  conf_set "$name" CPUS "$cpus"
+  conf_set "$name" NET "$net"
+  conf_set "$name" PORT "$(free_port)"
+  conf_set "$name" DISPOSABLE "$disposable"
+  [[ $disposable == 1 ]] || qemu-img create -q -f qcow2 "$QUBES/$name/home.qcow2" "$home"
+  [[ $disposable == 1 ]] || write_rules
+  say "created $name ($label, $template)"
+}
+
+cmd_start() {
+  local name=${1:?qube name}
+  require_qube "$name"
+  running "$name" && return 0
+  need qemu-system-x86_64 qemu-img socat
+  need_kvm
+  local template dir=$QUBES/$name
+  template=$(conf_get "$name" TEMPLATE)
+  template_running "$template" && die "template $template is running — wait for it to shut down"
+
+  # A fresh root every boot is the point: nothing persists outside /home.
+  rm -f "$dir/root.qcow2"
+  qemu-img create -q -f qcow2 -b "$TEMPLATES/$template.qcow2" -F qcow2 "$dir/root.qcow2" ||
+    die "could not create root overlay"
+  local -a drives=("$dir/root.qcow2")
+  [[ -f $dir/home.qcow2 ]] && drives+=("$dir/home.qcow2")
+
+  launch "$(unit "$name")" "$dir" "$(conf_get "$name" MEM 2G)" "$(conf_get "$name" CPUS 2)" \
+    "$(conf_get "$name" PORT)" "$(conf_get "$name" NET user)" "${drives[@]}" ||
+    die "could not start $name"
+  wait_ssh "$name" 120
+  guest_ssh "$name" sudo hostnamectl hostname "$name" 2>/dev/null
+  say "$name running"
+}
+
+cmd_stop() {
+  local name=${1:?qube name}
+  require_qube "$name"
+  running "$name" || return 0
+  qmp "$QUBES/$name/qmp.sock" system_powerdown
+  local deadline=$((SECONDS + 30))
+  while running "$name" && ((SECONDS < deadline)); do sleep 1; done
+  running "$name" && systemctl --user stop "$(unit "$name")"
+  rm -f "$QUBES/$name/root.qcow2"
+  say "$name stopped"
+}
+
+cmd_kill() {
+  local name=${1:?qube name}
+  require_qube "$name"
+  systemctl --user stop "$(unit "$name")" 2>/dev/null
+  rm -f "$QUBES/$name/root.qcow2"
+}
+
+cmd_delete() {
+  local name=${1:?qube name}
+  require_qube "$name"
+  cmd_kill "$name"
+  rm -rf "${QUBES:?}/$name"
+  write_rules
+  say "deleted $name"
+}
+
+# Starts the qube when needed, then forwards one app's windows. Blocks until the
+# app exits, which is what lets a disposable clean up after itself.
+cmd_run() {
+  local name=${1:?qube name}; shift
+  [[ $# -gt 0 ]] || die "usage: qube run <qube> <command…>"
+  require_qube "$name"
+  need waypipe
+  running "$name" || cmd_start "$name" || exit 1
+  # shellcheck disable=SC2046
+  waypipe --no-gpu --title-prefix "[$name] " \
+    ssh $(ssh_opts "$(conf_get "$name" PORT)") "$GUEST_USER@127.0.0.1" -- "$@"
+}
+
+cmd_dispvm() {
+  local template="" label=$DISP_LABEL net=user
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --template) template=$2; shift 2 ;;
+      --net) net=$2; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  [[ $# -gt 0 ]] || set -- foot
+  local name n=1
+  while exists "disp$n"; do n=$((n + 1)); done
+  name=disp$n
+  cmd_create "$name" --disposable --label "$label" --net "$net" \
+    ${template:+--template "$template"} 2>/dev/null || die "could not create $name"
+  trap 'cmd_delete "$name" 2>/dev/null' EXIT INT TERM
+  cmd_run "$name" "$@"
+}
+
+cmd_shell() {
+  local name=${1:?qube name}
+  require_qube "$name"
+  running "$name" || cmd_start "$name" || exit 1
+  # shellcheck disable=SC2046
+  ssh -t $(ssh_opts "$(conf_get "$name" PORT)") "$GUEST_USER@127.0.0.1"
+}
+
+# Explicit, one-way file transfer, like qvm-copy: host to qube, or qube to qube
+# through the host, landing in ~/QubesIncoming/<from>.
+cmd_copy() {
+  local from=${1:-} to=${2:-}; shift 2 || true
+  [[ -n $from && -n $to && $# -gt 0 ]] || die "usage: qube copy <from|host> <to> <path…>"
+  require_qube "$to"
+  running "$to" || cmd_start "$to" || exit 1
+  local dest="QubesIncoming/$from" port
+  port=$(conf_get "$to" PORT)
+  guest_ssh "$to" mkdir -p "$dest"
+  if [[ $from == host ]]; then
+    tar -cf - "$@" | guest_ssh "$to" tar -xf - -C "$dest"
+  else
+    require_qube "$from"
+    running "$from" || die "$from is not running"
+    guest_ssh "$from" tar -cf - "$@" | guest_ssh "$to" tar -xf - -C "$dest"
+  fi
+  say "copied into $to:~/$dest"
+}
+
+cmd_apps() {
+  local name=${1:?qube name}
+  require_qube "$name"
+  cat "$TEMPLATES/$(conf_get "$name" TEMPLATE).apps" 2>/dev/null
+}
+
+cmd_list() {
+  local json=0 conf name
+  [[ ${1:-} == --json ]] && json=1
+  local rows=()
+  for conf in "$QUBES"/*/conf; do
+    [[ -f $conf ]] || continue
+    name=$(basename "$(dirname "$conf")")
+    local state=halted label
+    running "$name" && state=running
+    label=$(conf_get "$name" LABEL gray)
+    rows+=("$name"$'\t'"$state"$'\t'"$label"$'\t'"${COLORS[$label]:-}"$'\t'"$(conf_get "$name" TEMPLATE)"$'\t'"$(conf_get "$name" NET user)"$'\t'"$(conf_get "$name" DISPOSABLE 0)")
+  done
+  if [[ $json == 1 ]]; then
+    printf '%s\n' "${rows[@]}" | jq -R -s -c '
+      split("\n") | map(select(length > 0) | split("\t") |
+        {name: .[0], state: .[1], label: .[2], color: (.[3] | sub("rgb\\((?<h>.*)\\)"; "#\(.h)")),
+         template: .[4], net: .[5], disposable: (.[6] == "1")})'
+    return
+  fi
+  [[ ${#rows[@]} -gt 0 ]] || { echo "no qubes — try: qube create work --label blue"; return; }
+  printf '%-16s %-8s %-7s %-10s %s\n' NAME STATE LABEL TEMPLATE NET
+  printf '%s\n' "${rows[@]}" | awk -F'\t' '{ printf "%-16s %-8s %-7s %-10s %s\n", $1, $2, $3, $5, $6 }'
+}
+
+cmd_label() {
+  local name=${1:?qube name} label=${2:?label}
+  require_qube "$name"
+  valid_label "$label" || die "label must be one of: ${!COLORS[*]}"
+  conf_set "$name" LABEL "$label"
+  write_rules
+}
+
+# Hyprland picks this file up on save. Each qube's title prefix gets its label
+# colour; disposables share one rule since their names come and go.
+write_rules() {
+  local conf name label
+  mkdir -p "$(dirname "$RULES")"
+  {
+    echo "-- Generated by qube. Edits are overwritten; change labels with: qube label <qube> <colour>"
+    echo "o.window({ title = \"^\\\\[disp[0-9]+\\\\] \" }, { border_color = \"${COLORS[$DISP_LABEL]}\", border_size = 3 })"
+    for conf in "$QUBES"/*/conf; do
+      [[ -f $conf ]] || continue
+      name=$(basename "$(dirname "$conf")")
+      [[ $name == disp[0-9]* ]] && continue
+      label=$(conf_get "$name" LABEL gray)
+      echo "o.window({ title = \"^\\\\[$name\\\\] \" }, { border_color = \"${COLORS[$label]}\", border_size = 3 })"
+    done
+  } >"$RULES.tmp"
+  cmp -s "$RULES.tmp" "$RULES" && { rm -f "$RULES.tmp"; return; }
+  mv "$RULES.tmp" "$RULES"
+}
+
+usage() {
+  cat <<'EOF'
+qube — Qubes-style compartments on Omarchy
+
+  qube template create [name] [--packages "pkg…"] [--size 20G]
+  qube template update|shell|delete <name>
+  qube template list
+
+  qube create <name> [--label red] [--template arch] [--mem 2G] [--cpus 2] [--net user|none] [--home 10G]
+  qube start|stop|kill|delete <name>
+  qube run <name> <command…>        forward one app's windows, starting the qube if needed
+  qube dispvm [--net none] [cmd…]   throwaway qube, deleted when the app exits
+  qube shell <name>                 terminal session in the qube
+  qube copy <from|host> <to> <path…>
+  qube apps <name>                  desktop apps its template provides
+  qube label <name> <colour>        red orange yellow green gray blue purple black
+  qube list [--json]
+EOF
+}
+
+main() {
+  local cmd=${1:-help}; shift || true
+  mkdir -p "$QUBES" "$TEMPLATES"
+  case $cmd in
+    template) cmd_template "$@" ;;
+    create) cmd_create "$@" ;;
+    start) cmd_start "$@" ;;
+    stop) cmd_stop "$@" ;;
+    kill) cmd_kill "$@" ;;
+    delete) cmd_delete "$@" ;;
+    run) cmd_run "$@" ;;
+    dispvm) cmd_dispvm "$@" ;;
+    shell) cmd_shell "$@" ;;
+    copy) cmd_copy "$@" ;;
+    apps) cmd_apps "$@" ;;
+    label) cmd_label "$@" ;;
+    list | ls) cmd_list "$@" ;;
+    rules) write_rules ;;
+    help | -h | --help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
