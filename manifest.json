@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.achevalier-dev.qubes",
+  "name": "Qubes",
+  "version": "0.1.0",
+  "author": "achevalier-dev",
+  "license": "MIT",
+  "description": "Qubes-style compartments in the Omarchy bar: which qubes run, in which colour, and the actions to start, stop and open apps in them.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "QubesPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "Qubes",
+    "description": "Running qubes as coloured dots next to a cube glyph. The panel lists every qube with its label, and opens a terminal, an app, or a disposable.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollSeconds": 5
+    },
+    "schema": [
+      {
+        "key": "pollSeconds",
+        "type": "number",
+        "label": "Refresh interval",
+        "description": "How often to ask `qube list` what is running. The call is local and cheap.",
+        "defaultValue": 5
+      }
+    ]
+  }
+}
