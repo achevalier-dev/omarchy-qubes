@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.achevalier-dev.qubes-manager",
+  "name": "Qubes Manager",
+  "version": "0.1.0",
+  "author": "achevalier-dev",
+  "license": "MIT",
+  "description": "Window for managing qubes: create, label, start, stop, open apps, and maintain templates. Summon with: omarchy-shell shell summon io.github.achevalier-dev.qubes-manager '{}'",
+  "kinds": [
+    "panel"
+  ],
+  "entryPoints": {
+    "panel": "Manager.qml"
+  }
+}
