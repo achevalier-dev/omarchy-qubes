@@ -11,6 +11,8 @@ Qubes-style compartments on Omarchy: KVM guests with a throwaway root, a private
 - `bin/qube-menu` — pickers and notifications for the menu and this widget.
 - `~/.config/hypr/qubes.lua` — generated border rules, loaded from `hyprland.lua`.
 - This widget — running qubes in the bar; the panel starts them and opens apps.
+- `manager/` — the Qubes Manager window: create, label, start, stop, open apps,
+  maintain templates. Setup › Qubes, the bar panel, or `qube-menu manager`.
 - `Super+Space` → Qubes — the same actions in the Omarchy menu.
 
 ## Install
@@ -18,7 +20,7 @@ Qubes-style compartments on Omarchy: KVM guests with a throwaway root, a private
 ```bash
 omarchy pkg add qemu-base waypipe socat jq
 git clone https://github.com/achevalier-dev/omarchy-qubes
-omarchy-qubes/install.sh           # links qube + qube-menu, menu rows, Hyprland hook
+omarchy-qubes/install.sh           # scripts, Qubes Manager window, menu rows, Hyprland hook
 omarchy plugin add https://github.com/achevalier-dev/omarchy-qubes --enable
 ```
 
