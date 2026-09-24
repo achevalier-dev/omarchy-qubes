@@ -1,4 +1,6 @@
   "qubes": {"icon":"󰆧","label":"Qubes","aliases":["qube","vm"],"description":"Isolated VM compartments","when":"omarchy-cmd-present qube"},
+  "qubes.manager": {"icon":"󰒓","label":"Qubes Manager","aliases":["qubes-manager"],"description":"Window for creating, labelling and running qubes","action":"qube-menu manager"},
+  "setup.qubes": {"icon":"󰆧","label":"Qubes","description":"Isolated VM compartments","when":"omarchy-cmd-present qube","action":"qube-menu manager"},
   "qubes.run": {"icon":"󰀻","label":"Run App","description":"Open an app in a qube, starting it if needed","when":"qube-menu has-qubes","action":"qube-menu run"},
   "qubes.terminal": {"icon":"󰆍","label":"Terminal","when":"qube-menu has-qubes","action":"qube-menu terminal"},
   "qubes.dispvm": {"icon":"󰩹","label":"Disposable","aliases":["dispvm"],"description":"Throwaway qube, deleted when the app closes","action":"qube-menu dispvm"},

@@ -150,6 +150,8 @@ cmd_template() {
   term "qube template $action $(printf '%q' "$t")"
 }
 
+cmd_manager() { omarchy-shell shell summon io.github.achevalier-dev.qubes-manager "${1:-{\}}" >/dev/null; }
+
 cmd_has_qubes() { [[ -n $(qubes) ]]; }
 cmd_has_running() { [[ -n $(qubes running) ]]; }
 
@@ -166,7 +168,8 @@ case ${1:-} in
   template-create) cmd_template create ;;
   template-update) cmd_template update ;;
   template-shell) cmd_template shell ;;
+  manager) shift; cmd_manager "$@" ;;
   has-qubes) cmd_has_qubes ;;
   has-running) cmd_has_running ;;
-  *) echo "qube-menu run|terminal|dispvm|start|stop|label|delete|create|shell|template-create|template-update|template-shell" >&2; exit 1 ;;
+  *) echo "qube-menu manager|run|terminal|dispvm|start|stop|label|delete|create|shell|template-create|template-update|template-shell" >&2; exit 1 ;;
 esac

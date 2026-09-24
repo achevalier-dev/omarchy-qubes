@@ -51,6 +51,7 @@ Panel {
       list.push({kind: "qube", key: q.name, label: q.name, color: q.color,
         detail: q.state === "running" ? "running · open app" : "halted · start", running: q.state === "running"})
     }
+    list.push({kind: "action", key: "manager", label: "Qubes Manager…"})
     list.push({kind: "action", key: "dispvm", label: "Disposable…"})
     if (runningQubes.length > 0) list.push({kind: "action", key: "stop", label: "Stop a qube…"})
     list.push({kind: "action", key: "create", label: "Create qube…"})
