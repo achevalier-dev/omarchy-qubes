@@ -26,6 +26,19 @@ case ":$PATH:" in
   *) echo "note: $BIN_DIR is not on PATH — the menu rows call qube-menu by name" >&2 ;;
 esac
 
+# The manager window is a plugin of its own: a bar widget's summon opens its
+# popup, so a separate window needs a separate id. Copied rather than linked,
+# because the shell's file watcher does not follow a symlinked plugin folder.
+MANAGER_DIR="$HOME/.config/omarchy/plugins/io.github.achevalier-dev.qubes-manager"
+rm -rf "$MANAGER_DIR"
+mkdir -p "$MANAGER_DIR"
+cp "$REPO/manager/manifest.json" "$REPO/manager/Manager.qml" "$MANAGER_DIR/"
+echo "installed the Qubes Manager window in $MANAGER_DIR"
+if command -v omarchy-shell >/dev/null; then
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+  omarchy plugin enable io.github.achevalier-dev.qubes-manager >/dev/null 2>&1 || true
+fi
+
 # The rows live between two markers, so a re-run swaps the block rather than
 # appending a second one. A file without the markers gets the block just
 # before its closing brace.
