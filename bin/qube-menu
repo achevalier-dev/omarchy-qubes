@@ -1,0 +1,172 @@
+#!/bin/bash
+# qube-menu — qube actions for the Omarchy menu and the Qubes bar widget.
+#
+# Menu rows run detached with no terminal, so quiet actions report back as
+# notifications and anything slow or interactive opens a floating terminal.
+# Lists are drawn with omarchy-menu-select at the moment a row is chosen,
+# because the menu itself is static JSON and cannot enumerate qubes.
+
+set -uo pipefail
+
+GLYPH="󰆧"
+
+notify() { omarchy-notification-send -g "$GLYPH" "Qubes" "$1" >/dev/null 2>&1; }
+fail() {
+  notify "$1"
+  exit 1
+}
+term() { omarchy-launch-floating-terminal-with-presentation "$*"; }
+detach() { setsid -f "$@" >/dev/null 2>&1 </dev/null; }
+
+# omarchy-menu-select takes "<glyph>\t<label>\t<subtext>" and gives back
+# "<label>\t<subtext>", so the label is the first field of the answer.
+pick() { # <prompt> <empty message> — options on stdin
+  local prompt=$1 empty=$2 options answer
+  options=$(cat)
+  [[ -n ${options//[[:space:]]/} ]] || fail "$empty"
+  answer=$(omarchy-menu-select "$prompt" <<<"$options") || exit 0
+  cut -f1 <<<"$answer"
+}
+
+dot() { echo ""; }
+
+qubes() { # [running|halted] — named qubes, disposables left out
+  qube list --json 2>/dev/null | jq -r --arg s "${1:-}" \
+    '.[] | select(.disposable | not) | select($s == "" or .state == $s) | [.name, .label, .state, .template] | @tsv'
+}
+
+pick_qube() { # <prompt> [state]
+  qubes "${2:-}" | while IFS=$'\t' read -r name label state template; do
+    printf '%s\t%s\t%s · %s · %s\n' "$(dot "$label")" "$name" "$label" "$state" "$template"
+  done | pick "$1" "No ${2:-} qubes${2:+ }— create one from the Qubes menu"
+}
+
+pick_app() { # <qube>
+  qube apps "$1" | while IFS=$'\t' read -r name exec; do
+    printf '󰀻\t%s\t%s\n' "$name" "$exec"
+  done | pick "Run in $1" "No apps cached for $1 — run: qube template update"
+}
+
+app_command() { # <qube> <app name>
+  qube apps "$1" | awk -F'\t' -v n="$2" '$1 == n { print $2; exit }'
+}
+
+cmd_run() {
+  local name=${1:-} app command
+  [[ -n $name ]] || name=$(pick_qube "Run app in")
+  [[ -n $name ]] || exit 0
+  app=$(pick_app "$name")
+  [[ -n $app ]] || exit 0
+  command=$(app_command "$name" "$app")
+  [[ -n $command ]] || fail "No command for $app"
+  running "$name" || notify "Starting $name…"
+  # shellcheck disable=SC2086
+  detach qube run "$name" $command
+}
+
+cmd_terminal() {
+  local name=${1:-}
+  [[ -n $name ]] || name=$(pick_qube "Terminal in")
+  [[ -n $name ]] || exit 0
+  running "$name" || notify "Starting $name…"
+  detach qube run "$name" foot
+}
+
+cmd_dispvm() {
+  local choice
+  choice=$(printf '󰆍\tTerminal\tfoot\n󰈹\tBrowser\tfirefox\n󰈹\tBrowser, offline\tno network\n' |
+    pick "Disposable" "nothing to run")
+  notify "Starting a disposable…"
+  case $choice in
+    Terminal) detach qube dispvm foot ;;
+    Browser) detach qube dispvm firefox ;;
+    "Browser, offline") detach qube dispvm --net none firefox ;;
+  esac
+}
+
+running() { qube list --json 2>/dev/null | jq -e --arg n "$1" '.[] | select(.name == $n and .state == "running")' >/dev/null; }
+
+cmd_start() {
+  local name=${1:-}
+  [[ -n $name ]] || name=$(pick_qube "Start" halted)
+  [[ -n $name ]] || exit 0
+  notify "Starting $name…"
+  local log
+  log=$(mktemp)
+  if qube start "$name" 2>"$log"; then
+    notify "$name is running"
+  else
+    notify "$(tail -n1 "$log")"
+  fi
+  rm -f "$log"
+}
+
+cmd_stop() {
+  local name=${1:-}
+  [[ -n $name ]] || name=$(pick_qube "Stop" running)
+  [[ -n $name ]] || exit 0
+  qube stop "$name" 2>/dev/null && notify "$name stopped"
+}
+
+cmd_label() {
+  local name=${1:-} label
+  [[ -n $name ]] || name=$(pick_qube "Relabel")
+  [[ -n $name ]] || exit 0
+  label=$(for l in red orange yellow green gray blue purple black; do printf '%s\t%s\t\n' "$(dot "$l")" "$l"; done |
+    pick "Label for $name" "no labels")
+  [[ -n $label ]] || exit 0
+  qube label "$name" "$label" && notify "$name is now $label"
+}
+
+cmd_delete() {
+  local name=${1:-} sure
+  [[ -n $name ]] || name=$(pick_qube "Delete")
+  [[ -n $name ]] || exit 0
+  sure=$(printf '󰅖\tKeep %s\t\n󰩹\tDelete %s\tits /home is destroyed\n' "$name" "$name" | pick "Delete $name?" "")
+  [[ $sure == "Delete $name" ]] || exit 0
+  qube delete "$name" 2>/dev/null && notify "$name deleted"
+}
+
+cmd_create() {
+  term 'read -rp "Name: " n && read -rp "Label (red orange yellow green gray blue purple black) [gray]: " l && read -rp "Network (user/none) [user]: " net && qube create "$n" --label "${l:-gray}" --net "${net:-user}"'
+}
+
+cmd_shell() {
+  local name=${1:-}
+  [[ -n $name ]] || name=$(pick_qube "Shell in")
+  [[ -n $name ]] || exit 0
+  omarchy-launch-floating-terminal-with-presentation "qube shell $(printf '%q' "$name")"
+}
+
+cmd_template() {
+  local action=$1 t
+  if [[ $action == create ]]; then
+    term "qube template create"
+    return
+  fi
+  t=$(qube template list | while read -r t; do printf '󰆧\t%s\t\n' "$t"; done |
+    pick "Template" "No templates — create one first")
+  [[ -n $t ]] || exit 0
+  term "qube template $action $(printf '%q' "$t")"
+}
+
+cmd_has_qubes() { [[ -n $(qubes) ]]; }
+cmd_has_running() { [[ -n $(qubes running) ]]; }
+
+case ${1:-} in
+  run) shift; cmd_run "$@" ;;
+  terminal) shift; cmd_terminal "$@" ;;
+  dispvm) cmd_dispvm ;;
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  label) shift; cmd_label "$@" ;;
+  delete) shift; cmd_delete "$@" ;;
+  create) cmd_create ;;
+  shell) shift; cmd_shell "$@" ;;
+  template-create) cmd_template create ;;
+  template-update) cmd_template update ;;
+  template-shell) cmd_template shell ;;
+  has-qubes) cmd_has_qubes ;;
+  has-running) cmd_has_running ;;
+  *) echo "qube-menu run|terminal|dispvm|start|stop|label|delete|create|shell|template-create|template-update|template-shell" >&2; exit 1 ;;
+esac
