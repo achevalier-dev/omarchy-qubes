@@ -526,7 +526,9 @@ cmd_copy() {
 cmd_apps() {
   local name=${1:?qube name}
   require_qube "$name"
-  cat "$TEMPLATES/$(conf_get "$name" TEMPLATE).apps" 2>/dev/null
+  # Helpers and daemons that ship desktop entries but are not apps to launch.
+  grep -v -E $'^(Avahi |Qt V4L2 |Foot Client\t|Foot Server\t)' \
+    "$TEMPLATES/$(conf_get "$name" TEMPLATE).apps" 2>/dev/null
 }
 
 cmd_list() {
